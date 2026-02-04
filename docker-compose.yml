@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  # FastAPI AI 분석 서버
+  ai-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-music-api
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=development
+      - PORT=8000
+      - EMS_API_URL=http://host.docker.internal:3001/api/ems
+      - DB_HOST=host.docker.internal
+      - DB_PORT=3306
+      - DB_NAME=music_space
+      - DB_USER=musicadmin
+      - DB_PASSWORD=${DB_PASSWORD:-your_password}
+      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
+      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
+    volumes:
+      # 개발 시 코드 변경 반영
+      - ./main.py:/app/main.py
+      - ./M1:/app/M1
+      - ./M2:/app/M2
+      - ./M3:/app/M3
+    restart: unless-stopped
+    networks:
+      - music-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+  # (선택) Redis 캐시
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: ai-redis
+  #   ports:
+  #     - "6380:6379"
+  #   networks:
+  #     - music-network
+
+networks:
+  music-network:
+    driver: bridge
