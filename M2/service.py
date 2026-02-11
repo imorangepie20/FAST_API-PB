@@ -433,19 +433,59 @@ class M2RecommendationService:
     
     def train_user_model(
         self,
+        db,
         user_id: int,
-        positive_tracks: List[Dict],
-        negative_tracks: List[Dict]
+        email: str = ""
     ) -> Dict:
-        """사용자 SVM 모델 학습"""
-        if len(positive_tracks) < 5:
+        """
+        사용자 SVM 모델 학습 (PMS 데이터 기반)
+        - M1/M3와 동일한 구조: db에서 PMS(positive), EMS(negative) 조회
+        - 저장 위치: user_models/user_{user_id}_svm.pkl
+        """
+        from sqlalchemy import text as sql_text
+
+        # 1. PMS 트랙 조회 (Positive - 사용자 선호)
+        pms_query = sql_text("""
+            SELECT t.track_id, t.title as track_name, t.artist,
+                   t.album as album_name, COALESCE(t.genre, 'unknown') as tags,
+                   COALESCE(t.duration, 200) * 1000 as duration_ms
+            FROM tracks t
+            JOIN playlist_tracks pt ON t.track_id = pt.track_id
+            JOIN playlists p ON pt.playlist_id = p.playlist_id
+            WHERE p.user_id = :user_id AND p.space_type = 'PMS'
+        """)
+        pms_result = db.execute(pms_query, {"user_id": user_id}).fetchall()
+
+        if not pms_result or len(pms_result) < 5:
             return {
                 "success": False,
-                "message": "최소 5곡 이상의 positive 샘플이 필요합니다"
+                "message": f"PMS 데이터 부족 ({len(pms_result) if pms_result else 0}개, 최소 5개 필요)"
             }
-        
+
+        # 2. EMS 트랙 조회 (Negative - 1:3 비율)
+        negative_count = len(pms_result) * 3
+        ems_query = sql_text("""
+            SELECT t.track_id, t.title as track_name, t.artist,
+                   t.album as album_name, COALESCE(t.genre, 'unknown') as tags,
+                   COALESCE(t.duration, 200) * 1000 as duration_ms
+            FROM tracks t
+            JOIN playlist_tracks pt ON t.track_id = pt.track_id
+            JOIN playlists p ON pt.playlist_id = p.playlist_id
+            WHERE p.space_type = 'EMS'
+            ORDER BY RAND()
+            LIMIT :limit
+        """)
+        ems_result = db.execute(ems_query, {"limit": negative_count}).fetchall()
+
+        # DataFrame 변환
+        columns = ['track_id', 'track_name', 'artist', 'album_name', 'tags', 'duration_ms']
+        positive_tracks = [dict(zip(columns, row)) for row in pms_result]
+        negative_tracks = [dict(zip(columns, row)) for row in ems_result]
+
+        logger.info(f"[M2] 사용자 {user_id}: PMS {len(positive_tracks)}곡 (positive), EMS {len(negative_tracks)}곡 (negative)")
+
         try:
-            # 1. 모든 트랙으로 TF-IDF fit
+            # 3. 모든 트랙으로 TF-IDF fit
             all_tracks = positive_tracks + negative_tracks
             texts = []
             for track in all_tracks:

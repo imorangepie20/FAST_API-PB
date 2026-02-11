@@ -410,6 +410,7 @@ class UnifiedRecommendRequest(BaseModel):
     model: str = "M1"  # M1, M2, M3
     top_k: int = 20
     ems_track_limit: int = 300  # EMS에서 분석할 곡 수 (기본값 증가)
+    track_ids: Optional[List[int]] = None  # 특정 트랙만 평가 (데모 페이지용)
 
 @app.post("/api/recommend")
 async def unified_recommend(request: UnifiedRecommendRequest):
@@ -432,9 +433,11 @@ async def unified_recommend(request: UnifiedRecommendRequest):
             from M1.service import M1RecommendationService
             model_path = os.path.join(os.path.dirname(__file__), "M1", "audio_predictor.pkl")
             service = M1RecommendationService(model_path=model_path)
-            
-            # EMS 곡 수 설정 적용하여 추천 생성
-            results = service.get_recommendations(db, user_id, ems_limit=ems_limit)
+
+            # EMS 곡 수 설정 적용하여 추천 생성 (track_ids 있으면 해당 트랙만 평가)
+            results = service.get_recommendations(
+                db, user_id, ems_limit=ems_limit, track_ids=request.track_ids
+            )
             
             if results.empty:
                 return {
@@ -465,19 +468,30 @@ async def unified_recommend(request: UnifiedRecommendRequest):
             from M2.service import get_m2_service
 
             m2_service = get_m2_service()
-            
+
             # EMS에서 후보 트랙 조회 (EMS는 공용)
             from sqlalchemy import text
-            ems_query = text("""
-                SELECT t.track_id, t.title, t.artist, t.album, t.duration, t.external_metadata
-                FROM tracks t
-                JOIN playlist_tracks pt ON t.track_id = pt.track_id
-                JOIN playlists p ON pt.playlist_id = p.playlist_id
-                WHERE p.space_type = 'EMS'
-                ORDER BY RAND()
-                LIMIT :limit
-            """)
-            ems_result = db.execute(ems_query, {"limit": ems_limit}).fetchall()
+
+            # track_ids가 제공되면 해당 트랙만 조회 (데모 페이지에서 동일 트랙 비교용)
+            if request.track_ids and len(request.track_ids) > 0:
+                track_ids_str = ','.join(map(str, request.track_ids))
+                ems_query = text(f"""
+                    SELECT t.track_id, t.title, t.artist, t.album, t.duration, t.external_metadata
+                    FROM tracks t
+                    WHERE t.track_id IN ({track_ids_str})
+                """)
+                ems_result = db.execute(ems_query).fetchall()
+            else:
+                ems_query = text("""
+                    SELECT t.track_id, t.title, t.artist, t.album, t.duration, t.external_metadata
+                    FROM tracks t
+                    JOIN playlist_tracks pt ON t.track_id = pt.track_id
+                    JOIN playlists p ON pt.playlist_id = p.playlist_id
+                    WHERE p.space_type = 'EMS'
+                    ORDER BY RAND()
+                    LIMIT :limit
+                """)
+                ems_result = db.execute(ems_query, {"limit": ems_limit}).fetchall()
             
             if not ems_result:
                 return {
@@ -526,9 +540,11 @@ async def unified_recommend(request: UnifiedRecommendRequest):
         elif model == "M3":
             # M3: CatBoost Collaborative Filtering
             from M3.service import get_m3_service
-            
+
             m3_service = get_m3_service()
-            result = m3_service.get_recommendations(db, user_id, top_k=request.top_k)
+            result = m3_service.get_recommendations(
+                db, user_id, top_k=request.top_k, track_ids=request.track_ids
+            )
             
             if not result.get("success"):
                 return result
@@ -590,79 +606,21 @@ async def unified_analyze(request: dict):
             return await analyze_user(req, db)
             
         elif model == "M2":
-            # M2 분석 (SVM 학습)
+            # M2 분석 (SVM 학습) - M1/M3와 동일하게 db 세션 전달
             from M2.service import get_m2_service
-            from sqlalchemy import text
 
             m2_service = get_m2_service()
-            
-            # PMS에서 Positive 트랙 조회
-            pms_query = text("""
-                SELECT t.title, t.artist, t.album, t.duration
-                FROM tracks t
-                JOIN playlist_tracks pt ON t.track_id = pt.track_id
-                JOIN playlists p ON pt.playlist_id = p.playlist_id
-                WHERE p.user_id = :user_id AND p.space_type = 'PMS'
-            """)
-            pms_result = db.execute(pms_query, {"user_id": user_id}).fetchall()
-            
-            positive_tracks = [
-                {
-                    'track_name': r[0],
-                    'artist': r[1],
-                    'album_name': r[2] or '',
-                    'tags': '',
-                    'duration_ms': (r[3] or 200) * 1000
-                }
-                for r in pms_result
-            ]
-            
-            if len(positive_tracks) < 5:
-                return {
-                    "success": False,
-                    "model": "M2",
-                    "user_id": user_id,
-                    "message": f"PMS에 최소 5곡 이상 필요합니다 (현재: {len(positive_tracks)}곡)"
-                }
-            
-            # EMS에서 Negative 트랙 샘플링 (EMS는 공용)
-            ems_query = text("""
-                SELECT t.title, t.artist, t.album, t.duration
-                FROM tracks t
-                JOIN playlist_tracks pt ON t.track_id = pt.track_id
-                JOIN playlists p ON pt.playlist_id = p.playlist_id
-                WHERE p.space_type = 'EMS'
-                ORDER BY RAND()
-                LIMIT :limit
-            """)
-            ems_result = db.execute(ems_query, {
-                "limit": len(positive_tracks) * 3
-            }).fetchall()
-            
-            negative_tracks = [
-                {
-                    'track_name': r[0],
-                    'artist': r[1],
-                    'album_name': r[2] or '',
-                    'tags': '',
-                    'duration_ms': (r[3] or 200) * 1000
-                }
-                for r in ems_result
-            ]
-            
-            # M2 모델 학습
-            result = m2_service.train_user_model(
-                user_id=user_id,
-                positive_tracks=positive_tracks,
-                negative_tracks=negative_tracks
-            )
-            
+
+            # M2 모델 학습 (내부에서 PMS/EMS 조회)
+            result = m2_service.train_user_model(db, user_id)
+
             return {
                 "success": result.get("success", False),
                 "model": "M2",
                 "user_id": user_id,
                 "message": result.get("message", "M2 SVM 모델 학습 완료"),
-                "track_count": len(positive_tracks),
+                "positive_count": result.get("positive_count", 0),
+                "negative_count": result.get("negative_count", 0),
                 "model_path": result.get("model_path")
             }
             
@@ -769,8 +727,8 @@ async def update_user_model_preference(user_id: int, request: UpdateModelRequest
             retrain_result = service.train_user_model(db, user_id, email)
             print(f"[Settings] M1 모델 재학습 완료: user_id={user_id}")
         elif model == "M2":
-            from M2.service import M2RecommendationService
-            m2_service = M2RecommendationService()
+            from M2.service import get_m2_service
+            m2_service = get_m2_service()
             retrain_result = m2_service.train_user_model(db, user_id, email)
             print(f"[Settings] M2 모델 재학습 완료: user_id={user_id}")
         elif model == "M3":

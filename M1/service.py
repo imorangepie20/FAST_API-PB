@@ -504,19 +504,20 @@ class M1RecommendationService:
         result = db.execute(query, params)
         return self._prepare_tracks_df(result)
     
-    def get_recommendations(self, db: Session, user_id: int, ems_limit: int = 100) -> pd.DataFrame:
+    def get_recommendations(self, db: Session, user_id: int, ems_limit: int = 100, track_ids: list = None) -> pd.DataFrame:
         """
         M1 추천 파이프라인 실행
-        
+
         1. PMS에서 사용자 프로필 생성 (없으면 전체 EMS 기반 프로필)
-        2. EMS에서 후보 트랙 추출 (ems_limit 개)
+        2. EMS에서 후보 트랙 추출 (ems_limit 개) 또는 track_ids로 특정 트랙만
         3. IntegratedRecommender로 4-Factor 점수 계산
         4. final_score >= 0.5 필터링 (PMS 없으면 0.5, 있으면 0.7)
-        
+
         Args:
             db: 데이터베이스 세션
             user_id: 사용자 ID
             ems_limit: EMS에서 분석할 곡 수 (기본값: 100)
+            track_ids: 특정 트랙 ID 목록 (데모 페이지에서 동일 트랙 비교용)
         """
         has_pms = True
         
@@ -536,17 +537,22 @@ class M1RecommendationService:
         user_profile = UserPreferenceProfile()
         user_profile.build_profile(pms_enhanced)
         
-        # 2. EMS 후보 트랙 조회 (ems_limit 적용)
-        ems_df = self.get_ems_tracks_from_db(db, user_id, limit=ems_limit)
-        if ems_df.empty:
-            # 사용자 EMS 없으면 전체 EMS에서 추출
-            print(f"[M1] 사용자 {user_id}의 EMS 데이터 없음 - 전체 EMS 사용")
-            ems_df = self.get_random_ems_tracks(db, limit=ems_limit)
+        # 2. EMS 후보 트랙 조회 (track_ids가 제공되면 해당 트랙만, 아니면 ems_limit 적용)
+        if track_ids and len(track_ids) > 0:
+            # 데모 페이지에서 특정 트랙 ID로 조회 (동일 트랙 비교용)
+            ems_df = self.get_tracks_by_ids(db, track_ids)
+            print(f"[M1] 특정 트랙 ID로 조회: {len(ems_df)}곡 (요청: {len(track_ids)}개)")
+        else:
+            ems_df = self.get_ems_tracks_from_db(db, user_id, limit=ems_limit)
             if ems_df.empty:
-                print(f"[M1] 전체 EMS 데이터도 없음")
-                return pd.DataFrame()
-        
-        print(f"[M1] EMS에서 {len(ems_df)}곡 분석 (설정: {ems_limit}곡)")
+                # 사용자 EMS 없으면 전체 EMS에서 추출
+                print(f"[M1] 사용자 {user_id}의 EMS 데이터 없음 - 전체 EMS 사용")
+                ems_df = self.get_random_ems_tracks(db, limit=ems_limit)
+            print(f"[M1] EMS에서 {len(ems_df)}곡 분석 (설정: {ems_limit}곡)")
+
+        if ems_df.empty:
+            print(f"[M1] EMS 데이터 없음")
+            return pd.DataFrame()
         
         # 3. 통합 추천 파이프라인 실행
         recommender = IntegratedRecommender(

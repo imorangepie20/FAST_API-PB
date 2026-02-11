@@ -262,7 +262,7 @@ async def generate_contextual_explanation(
         response = model.generate_content(
             prompt,
             generation_config=genai.types.GenerationConfig(
-                max_output_tokens=500,  # 5곡 기준 충분
+                max_output_tokens=2000,  # 20곡 기준
                 temperature=0.7
             )
         )

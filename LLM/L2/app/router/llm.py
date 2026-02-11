@@ -254,7 +254,7 @@ SEARCH_HELP = {
 class SemanticSearchRequest(BaseModel):
     """벡터 기반 자연어 검색 요청"""
     query: str = Field(..., description="자연어 검색어", example="비오는 날 카페에서 들을 잔잔한 재즈")
-    page: int = Field(1, ge=1, le=3, description="페이지 번호 (1=첫 5곡, 2=다음 5곡, 3=마지막 5곡)")
+    page: int = Field(1, ge=1, le=1, description="페이지 번호")
     include_explanation: bool = Field(True, description="LLM 추천 이유 포함 여부")
     genres: Optional[list[str]] = Field(None, description="장르 필터 (선택)")
     energy_min: Optional[float] = Field(None, ge=0, le=1)
@@ -314,9 +314,9 @@ async def search_music(request: SemanticSearchRequest):
     query_analysis = await analyze_query(request.query)
     search_query = query_analysis["english_query"]  # 영어로 번역된 쿼리
 
-    # 페이지네이션 (5곡씩)
-    page_size = 5
-    offset = (request.page - 1) * page_size
+    # 20곡 반환
+    page_size = 20
+    offset = 0
 
     # 2단계: 필터 구성 (요청 필터 + LLM 감성 필터 병합)
     filters = {}

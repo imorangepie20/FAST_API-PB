@@ -120,139 +120,122 @@ class M3RecommendationService:
         user_id: int,
         playlist_title: str = "MyPlaylist"
     ) -> Dict:
-        """사용자 CatBoost 모델 학습 (이메일 기반 저장)"""
+        """
+        사용자 CatBoost 모델 학습 (PMS 데이터 기반)
+        - M1과 동일한 구조: PMS 트랙으로 개인화 모델 학습
+        - 저장 위치: user_models/{email_prefix}_.cbm
+        """
         from sqlalchemy import text
 
-        # 데이터셋 로드 (dataset.csv 또는 DB EMS + M1 예측)
-        if not self._load_dataset():
-            print("[M3] 외부 데이터셋 없음, DB EMS 트랙 + M1 Audio Predictor 사용")
-
-            # DB에서 EMS 트랙 조회 (텍스트 메타데이터만)
-            ems_query = text("""
-                SELECT t.track_id, t.title as track_name, t.artist as artists,
-                       t.album as album_name, COALESCE(t.genre, 'unknown') as track_genre,
-                       COALESCE(t.duration, 200) as duration
-                FROM tracks t
-                JOIN playlist_tracks pt ON t.track_id = pt.track_id
-                JOIN playlists p ON pt.playlist_id = p.playlist_id
-                WHERE p.space_type = 'EMS'
-                LIMIT 5000
-            """)
-            ems_result = db.execute(ems_query).fetchall()
-
-            if not ems_result or len(ems_result) < 50:
-                return {
-                    "success": False,
-                    "message": f"EMS 데이터 부족 ({len(ems_result) if ems_result else 0}개, 최소 50개 필요)"
-                }
-
-            # 데이터프레임 생성
-            columns = ['track_id', 'track_name', 'artists', 'album_name', 'track_genre', 'duration']
-            self.df = pd.DataFrame(ems_result, columns=columns)
-            self.df['duration_ms'] = self.df['duration'] * 1000
-            self.df['popularity'] = 50  # M1이 필요로 하는 popularity 컬럼 추가
-
-            for col in FEATURES:
-                self.df[col] = self.df[col].fillna('unknown').astype(str)
-
-            print(f"[M3] DB에서 EMS 트랙 {len(self.df)}곡 로드, M1으로 audio features 예측 시작")
-
-            # M1 AudioFeaturePredictor로 audio features 예측
-            try:
-                from M1.spotify_recommender import AudioFeaturePredictor
-
-                m1_model_path = BASE_DIR.parent / "M1" / "audio_predictor.pkl"
-                predictor = AudioFeaturePredictor(model_type='Ridge')
-
-                if m1_model_path.exists():
-                    predictor.load(str(m1_model_path))
-                    print(f"[M3] M1 모델 로드 완료: {m1_model_path}")
-                else:
-                    logger.warning(f"M1 모델 없음: {m1_model_path}, 기본 예측 사용")
-
-                # M1으로 audio features 예측
-                predicted_df = predictor.predict(self.df)
-
-                # 예측된 audio features를 TARGET_COLUMNS에 매핑
-                feature_mapping = {
-                    'danceability': 'predicted_danceability',
-                    'energy': 'predicted_energy',
-                    'loudness': 'predicted_loudness',
-                    'speechiness': 'predicted_speechiness',
-                    'acousticness': 'predicted_acousticness',
-                    'instrumentalness': 'predicted_instrumentalness',
-                    'liveness': 'predicted_liveness',
-                }
-
-                for target_col, pred_col in feature_mapping.items():
-                    if pred_col in predicted_df.columns:
-                        values = predicted_df[pred_col].values
-                        # 예측값 분산이 너무 작으면 노이즈 추가
-                        if np.std(values) < 0.01:
-                            logger.info(f"{target_col} 분산 부족, 다양성 추가")
-                            noise = np.random.normal(0, 0.1, len(values))
-                            values = np.clip(values + noise, 0, 1)
-                        self.df[target_col] = values
-                    else:
-                        self.df[target_col] = 0.5  # 기본값
-
-                # key, mode 다양성 부여 (아티스트 + 장르 기반)
-                self.df['key'] = self.df.apply(
-                    lambda x: (hash(str(x['artists']) + str(x['track_genre'])) % 12), axis=1
-                )
-                self.df['mode'] = self.df.apply(
-                    lambda x: (hash(str(x['artists'])) % 2), axis=1
-                )
-
-                # 모든 target에 강제 다양성 추가 (CatBoost 학습을 위해)
-                print("[M3] 모든 target에 다양성 추가 중...")
-                for col in TARGET_COLUMNS:
-                    if col in self.df.columns:
-                        values = self.df[col].values.astype(float)
-                        # 강제 노이즈 추가 (분산 확보)
-                        noise = np.random.normal(0, 0.15, len(values))
-                        if col in ['key']:
-                            values = (values + np.random.randint(0, 3, len(values))) % 12
-                        elif col in ['mode']:
-                            pass  # mode는 이미 hash로 다양성 있음
-                        elif col in ['loudness']:
-                            values = values + np.random.normal(0, 2, len(values))
-                        else:
-                            values = np.clip(values + noise, 0, 1)
-                        self.df[col] = values
-                        std = np.std(self.df[col])
-                        print(f"[M3] {col} std={std:.4f}")
-                print(f"[M3] M1 audio features 예측 완료: {len(self.df)}곡")
-
-            except Exception as e:
-                logger.error(f"M1 예측 실패, 기본값 사용: {e}")
-                # M1 실패 시 기본값 사용
-                for col in TARGET_COLUMNS:
-                    if col not in self.df.columns:
-                        self.df[col] = 0.5 if col not in ['key', 'loudness', 'mode'] else 0
-
-            for col in TARGET_COLUMNS:
-                if col in self.df.columns:
-                    self.df[col] = self.df[col].fillna(0)
-
-        # 이메일 기반 모델 경로 생성
+        # 1. 사용자 이메일 조회
         try:
             query = text("SELECT email FROM users WHERE user_id = :user_id")
             result = db.execute(query, {"user_id": user_id}).fetchone()
             if not result:
-                return {
-                    "success": False,
-                    "message": "사용자를 찾을 수 없습니다"
-                }
+                return {"success": False, "message": "사용자를 찾을 수 없습니다"}
             email_prefix = result[0].split('@')[0]
             model_path = USER_MODELS_DIR / f"{email_prefix}_.cbm"
         except Exception as e:
             logger.error(f"사용자 이메일 조회 실패: {e}")
+            return {"success": False, "message": f"사용자 정보 조회 실패: {e}"}
+
+        # 2. PMS 트랙 조회 (사용자 선호 데이터)
+        pms_query = text("""
+            SELECT t.track_id, t.title as track_name, t.artist as artists,
+                   t.album as album_name, COALESCE(t.genre, 'unknown') as track_genre,
+                   COALESCE(t.duration, 200) as duration
+            FROM tracks t
+            JOIN playlist_tracks pt ON t.track_id = pt.track_id
+            JOIN playlists p ON pt.playlist_id = p.playlist_id
+            WHERE p.user_id = :user_id AND p.space_type = 'PMS'
+        """)
+        pms_result = db.execute(pms_query, {"user_id": user_id}).fetchall()
+
+        if not pms_result or len(pms_result) < 5:
             return {
                 "success": False,
-                "message": f"사용자 정보 조회 실패: {e}"
+                "message": f"PMS 데이터 부족 ({len(pms_result) if pms_result else 0}개, 최소 5개 필요)"
             }
 
+        print(f"[M3] 사용자 {user_id}의 PMS 트랙 {len(pms_result)}곡 로드")
+
+        # 3. 데이터프레임 생성 (PMS만 사용 - M1과 동일)
+        columns = ['track_id', 'track_name', 'artists', 'album_name', 'track_genre', 'duration']
+        self.df = pd.DataFrame(pms_result, columns=columns)
+        print(f"[M3] 학습 데이터: PMS {len(pms_result)}곡 (M1과 동일하게 PMS만 사용)")
+        self.df['duration_ms'] = self.df['duration'] * 1000
+        self.df['popularity'] = 50
+
+        for col in FEATURES:
+            self.df[col] = self.df[col].fillna('unknown').astype(str)
+
+        # 5. M1 AudioFeaturePredictor로 audio features 예측
+        try:
+            from M1.spotify_recommender import AudioFeaturePredictor
+
+            m1_model_path = BASE_DIR.parent / "M1" / "audio_predictor.pkl"
+            predictor = AudioFeaturePredictor(model_type='Ridge')
+
+            if m1_model_path.exists():
+                predictor.load(str(m1_model_path))
+                print(f"[M3] M1 모델 로드 완료: {m1_model_path}")
+
+            predicted_df = predictor.predict(self.df)
+
+            feature_mapping = {
+                'danceability': 'predicted_danceability',
+                'energy': 'predicted_energy',
+                'loudness': 'predicted_loudness',
+                'speechiness': 'predicted_speechiness',
+                'acousticness': 'predicted_acousticness',
+                'instrumentalness': 'predicted_instrumentalness',
+                'liveness': 'predicted_liveness',
+            }
+
+            for target_col, pred_col in feature_mapping.items():
+                if pred_col in predicted_df.columns:
+                    values = predicted_df[pred_col].values
+                    if np.std(values) < 0.01:
+                        noise = np.random.normal(0, 0.1, len(values))
+                        values = np.clip(values + noise, 0, 1)
+                    self.df[target_col] = values
+                else:
+                    self.df[target_col] = 0.5
+
+            # key, mode 다양성 부여
+            self.df['key'] = self.df.apply(
+                lambda x: (hash(str(x['artists']) + str(x['track_genre'])) % 12), axis=1
+            )
+            self.df['mode'] = self.df.apply(
+                lambda x: (hash(str(x['artists'])) % 2), axis=1
+            )
+
+            # 다양성 추가
+            for col in TARGET_COLUMNS:
+                if col in self.df.columns:
+                    values = self.df[col].values.astype(float)
+                    noise = np.random.normal(0, 0.15, len(values))
+                    if col == 'key':
+                        values = (values + np.random.randint(0, 3, len(values))) % 12
+                    elif col == 'loudness':
+                        values = values + np.random.normal(0, 2, len(values))
+                    elif col != 'mode':
+                        values = np.clip(values + noise, 0, 1)
+                    self.df[col] = values
+
+            print(f"[M3] M1 audio features 예측 완료: {len(self.df)}곡")
+
+        except Exception as e:
+            logger.error(f"M1 예측 실패, 기본값 사용: {e}")
+            for col in TARGET_COLUMNS:
+                if col not in self.df.columns:
+                    self.df[col] = 0.5 if col not in ['key', 'loudness', 'mode'] else 0
+
+        for col in TARGET_COLUMNS:
+            if col in self.df.columns:
+                self.df[col] = self.df[col].fillna(0)
+
+        # 6. CatBoost 모델 학습
         try:
             from catboost import CatBoostRegressor, Pool
             from sklearn.model_selection import train_test_split
@@ -315,28 +298,49 @@ class M3RecommendationService:
         self,
         db,
         user_id: int,
-        top_k: int = 50
+        top_k: int = 50,
+        track_ids: list = None
     ) -> Dict:
-        """추천 트랙 생성"""
+        """추천 트랙 생성
+
+        Args:
+            db: 데이터베이스 세션
+            user_id: 사용자 ID
+            top_k: 추천할 트랙 수
+            track_ids: 특정 트랙 ID 목록 (데모 페이지에서 동일 트랙 비교용)
+        """
         from sqlalchemy import text
 
         # 데이터셋 로드 (없으면 DB에서 EMS 트랙 사용)
         if not self._load_dataset():
             logger.warning("외부 데이터셋 없음, DB EMS 트랙 + M1 Audio Predictor 사용")
 
-            # DB에서 EMS 트랙 조회 (텍스트 메타데이터만)
-            ems_query = text("""
-                SELECT t.track_id, t.title as track_name, t.artist as artists,
-                       t.album as album_name, COALESCE(t.genre, 'unknown') as track_genre,
-                       COALESCE(t.duration, 200) as duration
-                FROM tracks t
-                JOIN playlist_tracks pt ON t.track_id = pt.track_id
-                JOIN playlists p ON pt.playlist_id = p.playlist_id
-                WHERE p.space_type = 'EMS'
-                ORDER BY RAND()
-                LIMIT 500
-            """)
-            ems_result = db.execute(ems_query).fetchall()
+            # track_ids가 제공되면 해당 트랙만 조회 (데모 페이지용)
+            if track_ids and len(track_ids) > 0:
+                track_ids_str = ','.join(map(str, track_ids))
+                ems_query = text(f"""
+                    SELECT t.track_id, t.title as track_name, t.artist as artists,
+                           t.album as album_name, COALESCE(t.genre, 'unknown') as track_genre,
+                           COALESCE(t.duration, 200) as duration
+                    FROM tracks t
+                    WHERE t.track_id IN ({track_ids_str})
+                """)
+                ems_result = db.execute(ems_query).fetchall()
+                logger.info(f"특정 트랙 ID로 조회: {len(ems_result)}곡 (요청: {len(track_ids)}개)")
+            else:
+                # 기존 EMS 랜덤 쿼리
+                ems_query = text("""
+                    SELECT t.track_id, t.title as track_name, t.artist as artists,
+                           t.album as album_name, COALESCE(t.genre, 'unknown') as track_genre,
+                           COALESCE(t.duration, 200) as duration
+                    FROM tracks t
+                    JOIN playlist_tracks pt ON t.track_id = pt.track_id
+                    JOIN playlists p ON pt.playlist_id = p.playlist_id
+                    WHERE p.space_type = 'EMS'
+                    ORDER BY RAND()
+                    LIMIT 500
+                """)
+                ems_result = db.execute(ems_query).fetchall()
 
             if not ems_result:
                 return {
@@ -588,11 +592,27 @@ class M3RecommendationService:
                 if ems_artist in pms_artists:
                     distances[i] *= 0.5  # 동일 아티스트는 50% 거리 감소
             
-            # 상위 N개 선택
-            top_indices = np.argsort(distances)[:top_k]
+            # 상위 N개 선택 (중복 제거 후 top_k 보장을 위해 여유분 조회)
+            top_indices = np.argsort(distances)[:top_k * 2]
             recommended_tracks = self.df.iloc[top_indices].copy()
             recommended_tracks['distance'] = distances[top_indices]
-            
+
+            # 중복 제거 (track_id 기준)
+            before_dedup = len(recommended_tracks)
+            recommended_tracks = recommended_tracks.drop_duplicates(subset=['track_id'], keep='first')
+
+            # 아티스트+제목 기준 중복 제거 (같은 곡이 다른 track_id로 존재할 수 있음)
+            recommended_tracks['artist_title_key'] = recommended_tracks['artists'].str.lower() + '|' + recommended_tracks['track_name'].str.lower()
+            recommended_tracks = recommended_tracks.drop_duplicates(subset=['artist_title_key'], keep='first')
+            recommended_tracks = recommended_tracks.drop(columns=['artist_title_key'])
+
+            after_dedup = len(recommended_tracks)
+            if before_dedup != after_dedup:
+                logger.info(f"[M3] 중복 제거: {before_dedup}곡 → {after_dedup}곡")
+
+            # top_k개로 제한
+            recommended_tracks = recommended_tracks.head(top_k)
+
             # Distance를 Score로 변환 (거리가 작을수록 점수가 높음)
             max_dist = float(distances.max()) if len(distances) > 0 and distances.max() > 0 else 1.0
             min_dist = float(distances.min()) if len(distances) > 0 else 0.0
