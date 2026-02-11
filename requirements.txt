@@ -20,6 +20,10 @@ sentence-transformers>=2.2.0
 faiss-cpu>=1.7.4
 google-genai>=0.1.0
 
+# L2 Deep Dive (ChromaDB + Gemini)
+google-generativeai>=0.8.0
+chromadb>=0.4.0
+
 # HTTP Client
 httpx>=0.26.0
 requests>=2.31.0

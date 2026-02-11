@@ -164,6 +164,23 @@ except Exception as e:
     print(f"[WARN] L1 Kuka Router failed: {e}")
 
 
+# ==================== L2 Deep Dive Router 등록 ====================
+
+try:
+    # L2 경로를 sys.path에 추가
+    l2_path = os.path.join(os.path.dirname(__file__), "LLM", "L2")
+    if l2_path not in sys.path:
+        sys.path.insert(0, l2_path)
+
+    from app.router.llm import router as l2_router
+    app.include_router(l2_router)
+    print("[OK] L2 Deep Dive Router registered (/api/llm)")
+except Exception as e:
+    import traceback
+    traceback.print_exc()
+    print(f"[WARN] L2 Deep Dive Router failed: {e}")
+
+
 # ==================== Pydantic Models (공통) ====================
 
 class TrackFeatures(BaseModel):

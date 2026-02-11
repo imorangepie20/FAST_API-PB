@@ -39,3 +39,10 @@ ENV/
 # Large model files (upload via FTP)
 LLM/L1/models/*.npy
 LLM/L1/*.zip
+
+# Large data files (ChromaDB, models, archives)
+LLM/L2/data/chroma_db/
+LLM/L2/data/*.csv
+LLM/L2/data/*.parquet
+LLM/L2/*.7z
+LLM/L2/*.zip
