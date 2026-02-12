@@ -458,10 +458,11 @@ async def unified_recommend(request: UnifiedRecommendRequest):
                     "recommendations": []
                 }
             
-            # GMS 저장
+            # top_k 적용 후 GMS 저장
+            results = results.head(request.top_k)
             playlist_id = service.save_gms_playlist(db, user_id, results)
 
-            recommendations = results.head(request.top_k).fillna(0).replace([np.inf, -np.inf], 0).to_dict(orient='records')
+            recommendations = results.fillna(0).replace([np.inf, -np.inf], 0).to_dict(orient='records')
             
             return {
                 "success": True,
@@ -524,6 +525,21 @@ async def unified_recommend(request: UnifiedRecommendRequest):
                 for r in ems_result
             ]
             
+            # 사용자 모델 존재 여부 확인 → 없으면 자동 학습
+            user_model = m2_service._load_user_model(user_id)
+            if user_model is None:
+                print(f"[M2] 사용자 {user_id} 모델 없음 → 자동 학습 시작")
+                train_result = m2_service.train_user_model(db, user_id)
+                if not train_result.get("success"):
+                    return {
+                        "success": False,
+                        "model": "M2",
+                        "user_id": user_id,
+                        "message": f"M2 모델 자동 학습 실패: {train_result.get('message', 'PMS 데이터 부족')}",
+                        "recommendations": []
+                    }
+                print(f"[M2] 사용자 {user_id} 자동 학습 완료")
+
             # M2 추천 실행
             recommendations = m2_service.get_recommendations(
                 user_id=user_id,

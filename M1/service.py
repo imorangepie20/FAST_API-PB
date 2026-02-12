@@ -563,8 +563,8 @@ class M1RecommendationService:
         )
         recommendations = recommender.recommend_with_search(ems_df)
         
-        # 4. GMS 품질 필터링 (threshold 완화: 0.5)
-        threshold = 0.5  # 기존 0.7에서 0.5로 완화
+        # 4. GMS 품질 필터링
+        threshold = 0.7
         gms_pass = recommendations[recommendations['final_score'] >= threshold].sort_values(
             by='final_score', ascending=False
         )
