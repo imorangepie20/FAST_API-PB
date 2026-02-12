@@ -81,13 +81,41 @@ class AudioPredictionService:
         tags: str = "",
         duration_ms: int = 200000
     ) -> Dict[str, float]:
-        """단일 트랙 오디오 피처 예측 (규칙 기반)"""
+        """단일 트랙 오디오 피처 예측 (ML 모델 우선, 실패 시 규칙 기반)"""
         self.load_model()
-        
-        # 규칙 기반 예측 (장르/태그 힌트 활용)
+
+        # ML 모델이 로드되었으면 실제 예측 사용
+        if self.models and self.vectorizers:
+            try:
+                from scipy.sparse import hstack, csr_matrix
+
+                artist_vec = self.vectorizers['artist'].transform([artist])
+                track_vec = self.vectorizers['track'].transform([track_name])
+                tags_vec = self.vectorizers['tags'].transform([tags])
+
+                numeric = np.array([[duration_ms, 50]])  # [duration_ms, popularity]
+                num_scaler = self.vectorizers.get('num_scaler')
+                if num_scaler is not None:
+                    numeric = num_scaler.transform(numeric)
+                numeric_sparse = csr_matrix(numeric)
+
+                X = hstack([artist_vec, track_vec, tags_vec, numeric_sparse])
+
+                predictions = {}
+                for feature in AUDIO_FEATURES:
+                    if feature in self.models:
+                        pred = self.models[feature].predict(X)[0]
+                        predictions[feature] = float(pred)
+                    else:
+                        predictions[feature] = 0.0
+
+                return predictions
+            except Exception as e:
+                logger.warning(f"ML 예측 실패, 규칙 기반 사용: {e}")
+
+        # 규칙 기반 fallback
         text = f"{artist} {track_name} {album_name} {tags}".lower()
-        
-        # 기본값
+
         predictions = {
             'danceability': 0.5,
             'energy': 0.5,
@@ -99,8 +127,7 @@ class AudioPredictionService:
             'tempo': 120.0,
             'loudness': -6.0
         }
-        
-        # 장르/키워드 기반 조정
+
         if any(kw in text for kw in ['edm', 'electronic', 'dance', 'club']):
             predictions['danceability'] = 0.8
             predictions['energy'] = 0.85
@@ -122,13 +149,12 @@ class AudioPredictionService:
         elif any(kw in text for kw in ['jazz', 'blues']):
             predictions['acousticness'] = 0.6
             predictions['instrumentalness'] = 0.4
-        
-        # 곡 길이 기반 조정
-        if duration_ms < 180000:  # 3분 미만
+
+        if duration_ms < 180000:
             predictions['energy'] = min(predictions['energy'] + 0.1, 1.0)
-        elif duration_ms > 360000:  # 6분 이상
+        elif duration_ms > 360000:
             predictions['instrumentalness'] = min(predictions['instrumentalness'] + 0.2, 1.0)
-        
+
         return predictions
 
 

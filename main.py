@@ -144,6 +144,16 @@ except Exception as e:
     print(f"[WARN] User Model Initialization Router failed: {e}")
 
 
+# ==================== Audio Enrichment Router 등록 ====================
+
+try:
+    from audio_enrichment import router as enrichment_router
+    app.include_router(enrichment_router)
+    print("[OK] Audio Enrichment Router registered")
+except Exception as e:
+    print(f"[WARN] Audio Enrichment Router failed: {e}")
+
+
 # ==================== L1 Kuka (Spotify Recommend) Router 등록 ====================
 
 try:

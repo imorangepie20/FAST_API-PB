@@ -453,6 +453,15 @@ async def init_user_models(request: dict):
             print(f"[InitModels] WARNING: {max_retries}회 시도 후에도 PMS에 트랙이 없습니다! userId={user_id}")
             print(f"[InitModels] 기본 모델만 복사됩니다.")
 
+        # PMS 트랙 오디오 특성 채우기 (M1 학습 전 필수)
+        print(f"[InitModels] PMS 트랙 오디오 특성 enrichment 시작...")
+        try:
+            from audio_enrichment import enrich_user_tracks
+            enrich_result = enrich_user_tracks(user_id, db)
+            print(f"[InitModels] Enrichment 결과: {enrich_result}")
+        except Exception as e:
+            print(f"[InitModels] Enrichment 실패 (계속 진행): {e}")
+
         # M1 모델 학습 (동기, 즉시 완료)
         print(f"[InitModels] M1 모델 학습 시작...")
         m1_result = train_m1_model(email, user_id, tracks, db)

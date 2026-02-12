@@ -46,3 +46,8 @@ LLM/L2/data/*.csv
 LLM/L2/data/*.parquet
 LLM/L2/*.7z
 LLM/L2/*.zip
+
+# User-specific trained models (runtime generated)
+M1/user_models/
+M2/user_svm_models/
+M3/user_models/*.cbm

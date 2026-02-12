@@ -659,7 +659,7 @@ class AudioPredictionService:
 
     def __init__(self, model_path: Optional[str] = None):
         if model_path is None:
-            model_path = BASE_DIR / 'models' / 'audio_prediction' / 'tfidf_gbr_models.pkl'
+            model_path = BASE_DIR / 'tfidf_gbr_models.pkl'
 
         self.model_path = Path(model_path)
         self.models = None
@@ -1282,7 +1282,10 @@ USER_MODELS_DIR.mkdir(parents=True, exist_ok=True)
 EMS_DATA_PATH = BASE_DIR / "data" / "ems_songs.csv"
 
 # DB 세션
-from app.database import SessionLocal
+try:
+    from database import SessionLocal
+except ImportError:
+    from app.database import SessionLocal
 
 
 def get_user_email_from_db(user_id: int) -> str:
