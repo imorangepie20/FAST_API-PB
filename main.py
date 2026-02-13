@@ -154,6 +154,16 @@ except Exception as e:
     print(f"[WARN] Audio Enrichment Router failed: {e}")
 
 
+# ==================== QLTY (Audio Feature Enrichment Pipeline) Router 등록 ====================
+
+try:
+    from QLTY.router import router as qlty_router
+    app.include_router(qlty_router)
+    print("[OK] QLTY Router registered (/api/qlty)")
+except Exception as e:
+    print(f"[WARN] QLTY Router failed: {e}")
+
+
 # ==================== L1 Kuka (Spotify Recommend) Router 등록 ====================
 
 try:

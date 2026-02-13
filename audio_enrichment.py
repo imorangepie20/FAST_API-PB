@@ -1,13 +1,13 @@
 """
 배치 오디오 특성 예측 + DB 저장 모듈
-M2 TF-IDF + GBR 모델을 사용하여 누락된 오디오 특성을 채워넣음
+QLTY 파이프라인(Divergence-Based Routing)을 사용하여 누락된 오디오 특성을 채워넣음
 """
 from fastapi import APIRouter
 from sqlalchemy import text
 from database import SessionLocal
 from pydantic import BaseModel
-from typing import List, Optional, Dict
-from pathlib import Path
+from typing import Dict, List, Optional
+import asyncio
 import json
 import logging
 import threading
@@ -18,7 +18,8 @@ router = APIRouter(prefix="/api", tags=["Audio Enrichment"])
 
 AUDIO_FEATURES = [
     'danceability', 'energy', 'speechiness', 'acousticness',
-    'instrumentalness', 'liveness', 'valence', 'tempo', 'loudness'
+    'instrumentalness', 'liveness', 'valence', 'tempo', 'loudness',
+    'music_key', 'mode', 'time_signature',
 ]
 
 # 백그라운드 작업 상태 추적
@@ -31,13 +32,20 @@ _enrichment_status = {
 }
 
 
-def _get_audio_service():
-    """M2의 실제 ML 기반 AudioPredictionService 로드"""
-    from M2.service import AudioPredictionService
-    model_path = Path(__file__).parent / "M2" / "tfidf_gbr_models.pkl"
-    service = AudioPredictionService(model_path=str(model_path))
-    service.load_model()
-    return service
+async def _qlty_predict(track: dict, db=None) -> Optional[Dict]:
+    """QLTY 파이프라인으로 단일 트랙 오디오 피처 예측 (Divergence-Based Routing 포함)"""
+    from QLTY.pipeline import enrich_track, TrackInput
+
+    track_input = TrackInput(
+        title=track.get('title') or '',
+        artist=track.get('artist') or '',
+        album=track.get('album') or '',
+        genre=track.get('genre') or '',
+        duration_ms=(track.get('duration') or 0) * 1000,
+        popularity=track.get('popularity') or 0,
+    )
+    result = await enrich_track(track_input, db=db)
+    return result.features if result.features else None
 
 
 def save_audio_features_to_db(db, track_id: int, features: Dict[str, float], existing_metadata=None):
@@ -56,7 +64,7 @@ def save_audio_features_to_db(db, track_id: int, features: Dict[str, float], exi
             metadata = {}
 
     metadata['audio_features'] = features
-    metadata['audio_features_source'] = 'tfidf_gbr_predicted'
+    metadata['audio_features_source'] = 'qlty_pipeline'
     metadata['audio_features_updated_at'] = datetime.now().isoformat()
 
     update_query = text("""
@@ -70,6 +78,9 @@ def save_audio_features_to_db(db, track_id: int, features: Dict[str, float], exi
             valence = :valence,
             tempo = :tempo,
             loudness = :loudness,
+            music_key = :music_key,
+            mode = :mode,
+            time_signature = :time_signature,
             external_metadata = :metadata
         WHERE track_id = :track_id
     """)
@@ -85,58 +96,62 @@ def save_audio_features_to_db(db, track_id: int, features: Dict[str, float], exi
         "valence": round(features.get('valence', 0), 4),
         "tempo": round(min(features.get('tempo', 120.0), 999.999), 3),
         "loudness": round(max(features.get('loudness', -6.0), -99.99), 2),
+        "music_key": int(features.get('music_key', 0)),
+        "mode": int(features.get('mode', 0)),
+        "time_signature": int(features.get('time_signature', 4)),
         "metadata": json.dumps(metadata, ensure_ascii=False)
     })
 
 
-def enrich_tracks_batch(track_rows: list, db, batch_size: int = 500) -> dict:
+async def _enrich_tracks_async(track_rows: list, db, commit_interval: int = 20) -> dict:
     """
-    트랙 리스트에 대해 배치 오디오 특성 예측 후 DB 저장
+    트랙 리스트에 대해 QLTY 파이프라인으로 오디오 특성 예측 후 DB 저장 (async 코어)
 
     Args:
-        track_rows: [{'track_id', 'title', 'artist', 'album', 'duration', 'external_metadata'}, ...]
+        track_rows: [{'track_id', 'title', 'artist', 'album', 'duration', ...}, ...]
         db: SQLAlchemy session
-        batch_size: ML 배치 크기
+        commit_interval: N곡마다 커밋
     """
-    audio_service = _get_audio_service()
     success = 0
     failed = 0
 
-    for i in range(0, len(track_rows), batch_size):
-        batch = track_rows[i:i + batch_size]
-
-        predictions = []
-        batch_failed = False
-        for t in batch:
-            try:
-                pred = audio_service.predict_single(
-                    artist=t.get('artist') or '',
-                    track_name=t.get('title') or '',
-                    duration_ms=(t.get('duration') or 200) * 1000
+    for i, track in enumerate(track_rows):
+        try:
+            features = await _qlty_predict(track, db=db)
+            if features:
+                save_audio_features_to_db(
+                    db, track['track_id'], features,
+                    track.get('external_metadata'),
                 )
-                predictions.append(pred)
-            except Exception as e:
-                logger.error(f"Batch prediction failed: {e}")
-                failed += len(batch)
-                batch_failed = True
-                break
-
-        if batch_failed:
-            continue
-
-        for track, features in zip(batch, predictions):
-            try:
-                save_audio_features_to_db(db, track['track_id'], features, track.get('external_metadata'))
                 success += 1
-            except Exception as e:
-                logger.error(f"Failed to save track {track['track_id']}: {e}")
+            else:
                 failed += 1
+        except Exception as e:
+            logger.error(f"[Enrich] Track {track['track_id']} failed: {e}")
+            failed += 1
 
-        db.commit()
-        _enrichment_status["processed"] = success
-        logger.info(f"[Enrich] Batch {i // batch_size + 1}: {len(batch)} tracks processed")
+        if (i + 1) % commit_interval == 0:
+            db.commit()
+            _enrichment_status["processed"] = success
+            logger.info(
+                f"[Enrich] Progress: {i+1}/{len(track_rows)} "
+                f"({success} success, {failed} failed)"
+            )
 
+    db.commit()
+    _enrichment_status["processed"] = success
     return {"success": success, "failed": failed}
+
+
+def enrich_tracks_batch(track_rows: list, db, commit_interval: int = 20) -> dict:
+    """sync wrapper — 별도 스레드/sync context용 (회원가입, 백그라운드 배치)"""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(
+            _enrich_tracks_async(track_rows, db, commit_interval)
+        )
+    finally:
+        loop.close()
 
 
 def enrich_user_tracks(user_id: int, db) -> dict:
@@ -145,7 +160,8 @@ def enrich_user_tracks(user_id: int, db) -> dict:
     회원가입(init-models) 시 M1 학습 전에 호출
     """
     query = text("""
-        SELECT t.track_id, t.title, t.artist, t.album, t.duration, t.external_metadata
+        SELECT t.track_id, t.title, t.artist, t.album, t.duration,
+               t.external_metadata, t.genre, t.popularity
         FROM tracks t
         JOIN playlist_tracks pt ON t.track_id = pt.track_id
         JOIN playlists p ON pt.playlist_id = p.playlist_id
@@ -162,7 +178,8 @@ def enrich_user_tracks(user_id: int, db) -> dict:
     track_rows = [
         {
             'track_id': r[0], 'title': r[1], 'artist': r[2],
-            'album': r[3], 'duration': r[4], 'external_metadata': r[5]
+            'album': r[3], 'duration': r[4], 'external_metadata': r[5],
+            'genre': r[6] or '', 'popularity': r[7] or 0,
         }
         for r in rows
     ]
@@ -248,7 +265,8 @@ def _run_batch_enrichment():
     db = SessionLocal()
     try:
         query = text("""
-            SELECT track_id, title, artist, album, duration, external_metadata
+            SELECT track_id, title, artist, album, duration,
+                   external_metadata, genre, popularity
             FROM tracks
             WHERE danceability IS NULL OR energy IS NULL
         """)
@@ -257,7 +275,8 @@ def _run_batch_enrichment():
         track_rows = [
             {
                 'track_id': r[0], 'title': r[1], 'artist': r[2],
-                'album': r[3], 'duration': r[4], 'external_metadata': r[5]
+                'album': r[3], 'duration': r[4], 'external_metadata': r[5],
+                'genre': r[6] or '', 'popularity': r[7] or 0,
             }
             for r in rows
         ]
@@ -283,7 +302,8 @@ async def enrich_specific_tracks(request: EnrichTracksRequest):
         params = {f"id_{i}": tid for i, tid in enumerate(request.track_ids)}
 
         query = text(f"""
-            SELECT track_id, title, artist, album, duration, external_metadata
+            SELECT track_id, title, artist, album, duration,
+                   external_metadata, genre, popularity
             FROM tracks
             WHERE track_id IN ({placeholders})
             AND (danceability IS NULL OR energy IS NULL)
@@ -296,12 +316,13 @@ async def enrich_specific_tracks(request: EnrichTracksRequest):
         track_rows = [
             {
                 'track_id': r[0], 'title': r[1], 'artist': r[2],
-                'album': r[3], 'duration': r[4], 'external_metadata': r[5]
+                'album': r[3], 'duration': r[4], 'external_metadata': r[5],
+                'genre': r[6] or '', 'popularity': r[7] or 0,
             }
             for r in rows
         ]
 
-        result = enrich_tracks_batch(track_rows, db)
+        result = await _enrich_tracks_async(track_rows, db)
         return EnrichTracksResponse(
             success=True,
             enriched_count=result["success"],
