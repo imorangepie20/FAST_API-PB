@@ -164,6 +164,16 @@ except Exception as e:
     print(f"[WARN] QLTY Router failed: {e}")
 
 
+# ==================== DBR (Divergence-Based Routing) Router 등록 ====================
+
+try:
+    from DBR.api import router as dbr_router
+    app.include_router(dbr_router)
+    print("[OK] DBR Router registered (/api/dbr)")
+except Exception as e:
+    print(f"[WARN] DBR Router failed: {e}")
+
+
 # ==================== L1 Kuka (Spotify Recommend) Router 등록 ====================
 
 try:

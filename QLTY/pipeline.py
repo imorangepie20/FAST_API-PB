@@ -23,8 +23,10 @@ from typing import Optional, Dict, List
 from dataclasses import dataclass, field
 from sqlalchemy.orm import Session
 
-from . import reccobeats, db_matcher, llm_estimator, m1_predictor
+from . import reccobeats, db_matcher, llm_estimator
 from .model import AudioFeatureModel, ALL_FEATURES
+from DBR import apply_divergence_routing, m1_predictor
+from DBR.constants import ROUTING_FEATURES
 
 logger = logging.getLogger(__name__)
 
@@ -87,87 +89,6 @@ class EnrichResult:
     def coverage(self) -> float:
         """피처 채움 비율 (0.0 ~ 1.0)"""
         return len(self.features) / len(ALL_FEATURES) if ALL_FEATURES else 0.0
-
-
-# ==================== Divergence-Based Routing ====================
-
-# QLTY(Gemini)가 강점인 장르 (승률 60%+)
-_QLTY_GENRES = {"pop", "rock", "afrobeats", "gaming", "reggae", "brazilian", "folk", "classical"}
-
-# QLTY가 M1보다 항상 나은 피처
-_QLTY_FEATURES = {"tempo", "acousticness"}
-
-# Divergence routing 대상 피처 (0~1 스케일 + tempo + loudness)
-_ROUTING_FEATURES = {
-    "danceability", "energy", "valence", "tempo",
-    "acousticness", "instrumentalness", "speechiness", "loudness",
-}
-
-
-def _norm_diff(feature: str, diff: float) -> float:
-    """피처별 normalized difference (0~1 스케일로 통일)."""
-    if feature == "tempo":
-        return diff / 250.0
-    if feature == "loudness":
-        return diff / 60.0
-    return diff
-
-
-def _apply_divergence_routing(
-    qlty_features: Dict,
-    m1_features: Dict,
-    genre: str,
-    popularity: float,
-) -> Dict:
-    """
-    QLTY와 M1 예측을 비교하여 피처별로 최적 값을 선택한다.
-
-    Returns:
-        라우팅된 최종 피처 dict (routing 대상 외 피처는 qlty_features 유지)
-    """
-    routed = dict(qlty_features)  # QLTY 값을 기본으로 복사
-
-    for feat in _ROUTING_FEATURES:
-        qlty_val = qlty_features.get(feat)
-        m1_val = m1_features.get(feat)
-
-        if qlty_val is None or m1_val is None:
-            continue
-
-        div = _norm_diff(feat, abs(m1_val - qlty_val))
-
-        # 1. High divergence → M1 (QLTY 17% 승률)
-        if div > 0.16:
-            routed[feat] = m1_val
-            continue
-
-        # 2. QLTY 강점 장르 → QLTY 유지
-        if genre in _QLTY_GENRES:
-            continue
-
-        # 3. QLTY 강점 피처 → QLTY 유지
-        if feat in _QLTY_FEATURES:
-            continue
-
-        # 4. Low divergence → 평균 (두 모델 합의)
-        if div < 0.05:
-            routed[feat] = round((m1_val + qlty_val) / 2, 3)
-            continue
-
-        # 5. Mid divergence → 가중 평균 (M1:60 QLTY:40)
-        if div < 0.10:
-            routed[feat] = round(m1_val * 0.6 + qlty_val * 0.4, 3)
-            continue
-
-        # 6. High popularity → 가중 평균
-        if popularity >= 80:
-            routed[feat] = round(m1_val * 0.6 + qlty_val * 0.4, 3)
-            continue
-
-        # 7. Default → M1
-        routed[feat] = m1_val
-
-    return routed
 
 
 def _merge_features(
@@ -274,13 +195,13 @@ async def enrich_track(
                 )
                 if m1_features:
                     result.attempted.append("divergence_routing")
-                    routed = _apply_divergence_routing(
+                    routed = apply_divergence_routing(
                         qlty_features, m1_features,
                         genre=track.genre.lower(),
                         popularity=track.popularity,
                     )
                     routed_count = sum(
-                        1 for f in _ROUTING_FEATURES
+                        1 for f in ROUTING_FEATURES
                         if routed.get(f) != qlty_features.get(f)
                     )
                     added = _merge_features(result, routed, "divergence_routed")
